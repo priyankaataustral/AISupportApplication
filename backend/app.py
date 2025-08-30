@@ -1,3 +1,5 @@
+import io
+from flask import send_file
 from sqlalchemy import or_
 from flask import Blueprint, request, jsonify, abort, current_app, url_for, redirect
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -21,8 +23,8 @@ from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 from dotenv import load_dotenv
 from openai import OpenAI
+from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.dialects.sqlite import JSON as SQLiteJSON
-from extensions import db
 from category_map import LABELS, TEAM_MAP
 import smtplib
 from email.mime.text import MIMEText
@@ -36,24 +38,26 @@ import sqlalchemy as sa
 from flask_migrate import Migrate
 from flask import redirect, request  # request used below for the redirect
 
-DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"  # turn off later
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
-app = Flask(__name__)
-# CORS(app, origins=["http://localhost:3000"], supports_credentials=True)
-
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    # set True in prod behind HTTPS:
-    SESSION_COOKIE_SECURE=False,
-)
-
+# 1. Load environment variables immediately after imports.
 load_dotenv()
 
-SECRET_KEY = os.getenv("JWT_SECRET", "supersecretkey")
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-me-dev-secret")
+# 2. Get environment variables and fallbacks.
+DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
+frontend_url = os.getenv("FRONTEND_URL")
+if not frontend_url:
+    print("Warning: FRONTEND_URL environment variable is not set. Defaulting to localhost.")
+    frontend_url = "http://localhost:3000"
 
+# 3. Initialize Flask application.
+app = Flask(__name__)
+
+# 4. Initialize CORS with the now-available variable.
+print(f"Using CORS origin: {frontend_url}")
+CORS(app, resources={r"/*": {"origins": frontend_url}})
+CORS(app, origins=[frontend_url], supports_credentials=True) # A single CORS declaration is needed, but I'll leave both for now.
+
+# 5. The rest of your Flask & DB setup follows.
+SECRET_KEY = os.getenv("JWT_SECRET", "supersecretkey")
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_KEY:
@@ -64,18 +68,9 @@ basedir = os.path.abspath(os.path.dirname(__file__))
 # Always use the root tickets.db, never the instance folder
 db_path = os.path.join(os.path.dirname(__file__), '..', 'tickets.db')
 db_path = os.path.abspath(db_path)
-
 app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{db_path}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db.init_app(app)
-
-# --- Auth / Licensing wiring ---
-from routes_auth import bp as auth_bp, init_auth
-from routes_license import bp as license_bp
-from license_gate import license_gate
-
-
-import models_license
+db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 
 # ─── SMTP / Email config ──────────────────────────────────────────────────────
@@ -667,14 +662,6 @@ with app.app_context():
         db.session.add_all([Department(name=n) for n in ['ERP','CRM','SRM','Network','Security']])
         db.session.commit()
 
-# --- OIDC / SSO ---
-init_auth(app)                 # sets up Authlib client & session settings
-
-# --- Blueprints ---
-app.register_blueprint(auth_bp)     # /auth/login, /auth/callback, /auth/me, /auth/logout
-app.register_blueprint(license_bp)  # /license/check
-
-
 # ─── OpenAI & FAISS setup ──────────────────────────────────────────────────────
 # Create FAISS index for KB articles
 def create_faiss_index():
@@ -1133,7 +1120,8 @@ def require_role(*allowed):
         def wrapper(*args, **kwargs):
             token = (request.headers.get("Authorization","").replace("Bearer ","")
                      or request.cookies.get("token"))
-            if not token: return jsonify(error="unauthorized"), 401
+            if not token:
+                return jsonify(error="unauthorized"), 401
             try:
                 user = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
             except Exception:
@@ -1215,16 +1203,8 @@ def login():
     return resp
 
 # ─── Endpoints ─────────────────────────────────────────────────────────────────
-
-@app.get("/embed")
-@license_gate(required_feature="kb")   # requires features: {"kb": "on"}
-def embed_widget():
-    return {"ok": True, "msg": "licensed & kb feature enabled"}
-
-
 @app.route("/threads", methods=["GET"])
 @require_role("L1","L2","L3","MANAGER")
-# @license_gate()
 def list_threads():
 
     df = load_df()
@@ -1335,9 +1315,81 @@ def list_threads():
 
 #     return jsonify(ticket), 200
 
+@app.route("/threads/<thread_id>/download-summary", methods=["OPTIONS"])
+def download_summary_options(thread_id):
+    response = app.make_response("")
+    response.headers['Access-Control-Allow-Origin'] = request.headers.get("Origin", "http://localhost:3000")
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,PATCH,OPTIONS'
+    return response
+
+@app.route("/threads/<thread_id>/download-summary", methods=["GET"])
+def download_ticket_summary(thread_id):
+    import logging
+    logging.warning(f"[DOWNLOAD] Origin: {request.headers.get('Origin')}")
+    logging.warning(f"[DOWNLOAD] Request headers: {dict(request.headers)}")
+    t = db.session.get(Ticket, thread_id)
+    if not t:
+        return jsonify(error="Ticket not found"), 404
+    # Find the agent who escalated (from timeline events)
+    events = (TicketEvent.query
+              .filter_by(ticket_id=thread_id)
+              .order_by(TicketEvent.created_at.asc())
+              .all())
+    escalated_event = next((e for e in events if e.event_type == "ESCALATED"), None)
+    agent_name = None
+    escalation_time = None
+    if escalated_event:
+        escalation_time = escalated_event.created_at
+        if escalated_event.actor_agent_id:
+            agent = db.session.get(Agent, escalated_event.actor_agent_id)
+            agent_name = agent.name if agent else None
+    # Get all messages after escalation
+    messages = Message.query.filter_by(ticket_id=thread_id).order_by(Message.timestamp.asc()).all()
+    if escalation_time:
+        messages = [m for m in messages if str(m.timestamp) >= str(escalation_time)]
+    chat_text = "\n".join(m.content for m in messages)
+    # Summarize with OpenAI
+    summary = ""
+    if chat_text:
+        try:
+            resp = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": "Summarize the following support ticket chat after escalation in 1-2 sentences."},
+                    {"role": "user", "content": chat_text}
+                ],
+                max_tokens=80, temperature=0.5
+            )
+            summary = resp.choices[0].message.content.strip()
+        except Exception as e:
+            summary = chat_text[:200] + "..." if chat_text else "No chat after escalation."
+    else:
+        summary = "No chat messages after escalation."
+    summary_text = f"Ticket ID: {t.id}\nStatus: {t.status}\nLevel: {t.level}\nSubject: {t.subject}\n\nSummary: {summary}\n\nEscalated by: {agent_name or 'Unknown'}\n"
+    # Create downloadable file
+    file_stream = io.BytesIO()
+    file_stream.write(summary_text.encode('utf-8'))
+    file_stream.seek(0)
+    response = send_file(file_stream, as_attachment=True, download_name=f"ticket_{t.id}_summary.txt", mimetype="text/plain")
+    allowed_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://192.168.0.17:3000",  # Add any other dev IPs here
+    ]
+    origin = request.headers.get("Origin")
+    if origin in allowed_origins:
+        response.headers['Access-Control-Allow-Origin'] = origin
+    else:
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'  # fallback or remove for stricter security
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Vary'] = 'Origin'
+    return response
+
+
 @app.route("/threads/<thread_id>", methods=["GET"])
 @require_role("L1","L2","L3","MANAGER")
-# @license_gate()
 def get_thread(thread_id):
     t = db.session.get(Ticket, thread_id)
 
@@ -1835,7 +1887,6 @@ def get_mentions(agent_name):
 
 @app.route("/me", methods=["GET"])
 @require_role()
-@license_gate()
 def get_current_agent():
     return jsonify(getattr(request, "agent_ctx", {})), 200
     
@@ -1893,7 +1944,6 @@ def claim_ticket(thread_id):
 
 # Inbox: Get all tickets where an agent was @mentioned
 @app.route('/inbox/mentions/<int:agent_id>', methods=['GET'])
-@require_role()
 def get_tickets_where_agent_mentioned(agent_id):
     import sqlite3
     DB_PATH = app.config['SQLALCHEMY_DATABASE_URI'].replace('sqlite:///', '')
@@ -1920,7 +1970,11 @@ def get_tickets_where_agent_mentioned(agent_id):
         ticket_id, status = row[0], row[1]
         subject = subject_map.get(ticket_id, "")
         results.append({"ticket_id": ticket_id, "status": status, "subject": subject})
-    return jsonify(results)
+    response = jsonify(results)
+    response.headers['Access-Control-Allow-Origin'] = FRONTEND_URL
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Vary'] = 'Origin'
+    return response
 
 # For solution confirmation, we will send an email with a signed token that the user can click to confirm their solution.
 @app.route("/solutions/<int:solution_id>/send_confirmation_email", methods=["POST"])
