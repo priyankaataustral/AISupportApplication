@@ -1,17 +1,25 @@
-# Use a slim version of Python for a smaller image
 FROM python:3.12-slim
 
-# Set the working directory inside the container
-WORKDIR /backend
+WORKDIR /app
 
-# Copy the backend code into the working directory
-COPY ./backend /backend
+# Install build deps only if needed (pymysql doesn’t require MySQL dev libs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+  && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies from requirements.txt
-RUN pip install --no-cache-dir -r /backend/requirements.txt
+# Copy requirements first (for caching)
+COPY ./backend/requirements.txt .
 
-# Expose the port your Flask app runs on
+RUN pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
+
+# Copy all backend code
+COPY ./backend .
+
+# Ensure logs print straight to console
+ENV PYTHONUNBUFFERED=1 \
+    PORT=8000
+
 EXPOSE 8000
 
-# Run gunicorn to serve the Flask application
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "run:app"]
